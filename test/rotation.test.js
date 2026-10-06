@@ -266,6 +266,232 @@ test('持久化：提交后重载状态一致；并发补签只收敛为一个�
   assert.ok(!fs.existsSync(`${file}.tmp`), '原子提交不残留临时文件');
 });
 
+test('持久化：多代连续轮换后重启，全部已激活检查点与证据按序保留', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotation-chain-'));
+  const file = path.join(dir, 'state.json');
+  const store = new Store(file);
+  store.load();
+
+  // 连续三代轮换：genesis(0) → r1(1) → r2(2) → r3(3)，每轮 2-of-2 分批签名。
+  let members = [genKey(), genKey()];
+  const created = await store.commit((s) =>
+    rotation.createDomain(s, { name: '多代链', publicKeys: members.map((m) => m.publicKey), threshold: 2 }, NOW),
+  );
+  const domainId = created.id;
+
+  for (const rotationId of ['r1', 'r2', 'r3']) {
+    const before = store.state.domains[domainId];
+    const parentDigest = before.headDigest;
+    const nextMembers = [genKey(), genKey()];
+    await store.commit((s) =>
+      rotation.createRotation(
+        s,
+        domainId,
+        { rotationId, parentDigest, publicKeys: nextMembers.map((m) => m.publicKey), threshold: 2 },
+        NOW,
+      ),
+    );
+    const candidate = store.state.domains[domainId].rotations[rotationId];
+    const message = rotation.authorizationMessage(candidate);
+    // 两名父成员分两批提交。
+    await store.commit((s) =>
+      rotation.submitSignatures(s, domainId, rotationId, [{ publicKey: members[0].publicKey, signature: sign(members[0].privateKey, message) }], NOW),
+    );
+    const activated = await store.commit((s) =>
+      rotation.submitSignatures(s, domainId, rotationId, [{ publicKey: members[1].publicKey, signature: sign(members[1].privateKey, message) }], NOW),
+    );
+    assert.equal(activated.activated, true, `轮换 ${rotationId} 应激活`);
+    assert.equal(activated.headDigest, candidate.digest);
+    members = nextMembers;
+  }
+
+  const beforeRestart = store.state.domains[domainId];
+  assert.equal(beforeRestart.generation, 3);
+  assert.equal(Object.keys(beforeRestart.checkpoints).length, 4, '重启前应有 4 个已激活检查点');
+
+  const reloaded = new Store(file);
+  reloaded.load();
+  const after = reloaded.state.domains[domainId];
+  const chain = Object.values(after.checkpoints).sort((a, b) => a.generation - b.generation);
+  assert.equal(chain.length, 4, '重启后必须仍有 4 个检查点（中间代不得丢失）');
+  assert.deepEqual(
+    chain.map((c) => c.generation),
+    [0, 1, 2, 3],
+    '代次必须连续有序',
+  );
+  for (let i = 1; i < chain.length; i += 1) {
+    assert.equal(chain[i].parentDigest, chain[i - 1].digest, `代次 ${chain[i].generation} 父摘要必须衔接到上一代`);
+    assert.equal(rotation.checkpointDigest(chain[i]), chain[i].digest, `代次 ${chain[i].generation} 摘要必须自洽`);
+    assert.deepEqual(chain[i].keys, [...new Set(chain[i].keys)].sort(), '密钥集必须排序去重');
+    assert.equal(chain[i].evidence.length, 2, `代次 ${chain[i].generation} 必须恰有两份证据`);
+    const signers = chain[i].evidence.map((e) => e.publicKey);
+    assert.equal(new Set(signers).size, 2, '证据签名者必须去重');
+    const parent = chain[i - 1];
+    for (const evidence of chain[i].evidence) {
+      assert.ok(parent.keys.includes(evidence.publicKey), '证据签名者必须是父密钥成员');
+      const rot = after.rotations[chain[i].rotationId];
+      assert.ok(
+        rotation.verifyAuthorization(rotation.authorizationMessage(rot), evidence.signature, evidence.publicKey),
+        '每份证据必须对规范消息验签通过',
+      );
+    }
+  }
+  assert.equal(after.headDigest, beforeRestart.headDigest, '重启不得改变活动链头');
+  assert.equal(after.generation, 3);
+});
+
+test('恢复：已被错误压缩的中间检查点凭已激活轮换记录安全重建；待签/已拒候选不入链', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotation-recover-'));
+  const file = path.join(dir, 'state.json');
+
+  // 直接按领域模型构造一份“两代已激活 + 待签/已拒候选”的状态，
+  // 再模拟旧版 Store 的错误压缩：checkpoints 只留创世与链头。
+  const state = { version: 1, domains: {} };
+  const members = [genKey(), genKey()];
+  const made = rotation.createDomain(state, { name: '受损域', publicKeys: members.map((m) => m.publicKey), threshold: 2 }, NOW);
+  const domainId = made.result.id;
+  let s = made.state;
+
+  const nextA = [genKey(), genKey()];
+  s = rotation.createRotation(s, domainId, { rotationId: 'r1', parentDigest: made.result.headDigest, publicKeys: nextA.map((k) => k.publicKey), threshold: 2 }, NOW).state;
+  const rot1 = s.domains[domainId].rotations.r1;
+  const msg1 = rotation.authorizationMessage(rot1);
+  s = rotation.submitSignatures(s, domainId, 'r1', [{ publicKey: members[0].publicKey, signature: sign(members[0].privateKey, msg1) }], NOW).state;
+  s = rotation.submitSignatures(s, domainId, 'r1', [{ publicKey: members[1].publicKey, signature: sign(members[1].privateKey, msg1) }], NOW).state;
+
+  const head1 = s.domains[domainId].headDigest;
+  const nextB = [genKey(), genKey()];
+  s = rotation.createRotation(s, domainId, { rotationId: 'r2', parentDigest: head1, publicKeys: nextB.map((k) => k.publicKey), threshold: 2 }, NOW).state;
+  const rot2 = s.domains[domainId].rotations.r2;
+  const msg2 = rotation.authorizationMessage(rot2);
+  s = rotation.submitSignatures(s, domainId, 'r2', [{ publicKey: nextA[0].publicKey, signature: sign(nextA[0].privateKey, msg2) }], NOW).state;
+  s = rotation.submitSignatures(s, domainId, 'r2', [{ publicKey: nextA[1].publicKey, signature: sign(nextA[1].privateKey, msg2) }], NOW).state;
+
+  const intact = s.domains[domainId];
+  // 待签与已拒候选（任何时刻都不得被重建为检查点）。
+  s = rotation.createRotation(s, domainId, { rotationId: 'pending-after', parentDigest: intact.headDigest, publicKeys: [genKey().publicKey, genKey().publicKey], threshold: 2 }, NOW).state;
+
+  const damaged = {
+    ...s,
+    domains: {
+      ...s.domains,
+      [domainId]: {
+        ...s.domains[domainId],
+        checkpoints: {
+          [intact.checkpoints[made.result.headDigest].digest]: intact.checkpoints[made.result.headDigest],
+          [intact.headDigest]: intact.checkpoints[intact.headDigest],
+        },
+      },
+    },
+  };
+  fs.writeFileSync(file, JSON.stringify(damaged, null, 2));
+
+  const store = new Store(file);
+  store.load();
+  const healed = store.state.domains[domainId];
+  const chain = Object.values(healed.checkpoints).sort((a, b) => a.generation - b.generation);
+  assert.equal(chain.length, 3, '应恢复全部三个已激活检查点');
+  assert.deepEqual(chain.map((c) => c.generation), [0, 1, 2]);
+  assert.equal(chain[1].digest, rot1.digest, '中间代检查点必须被重建');
+  assert.equal(chain[1].parentDigest, chain[0].digest);
+  assert.equal(chain[2].parentDigest, chain[1].digest);
+  assert.equal(chain[1].evidence.length, 2);
+  assert.equal(healed.headDigest, intact.headDigest, '恢复不得改变活动链头');
+  assert.equal(healed.rotations['pending-after'].status, 'pending');
+  assert.equal(healed.checkpoints[healed.rotations['pending-after'].digest], undefined, '待签候选不得伪造成检查点');
+
+  // 修复后的文件再次加载应保持稳定（幂等，无二次“恢复”）。
+  const again = new Store(file);
+  again.load();
+  assert.equal(Object.keys(again.state.domains[domainId].checkpoints).length, 3);
+});
+
+test('恢复：证据被篡改或不足门限时拒绝伪造历史', () => {
+  const state = { version: 1, domains: {} };
+  const members = [genKey(), genKey()];
+  const made = rotation.createDomain(state, { name: '篡改域', publicKeys: members.map((m) => m.publicKey), threshold: 2 }, NOW);
+  const domainId = made.result.id;
+  let s = made.state;
+  const nextKeys = [genKey(), genKey()];
+  s = rotation.createRotation(s, domainId, { rotationId: 'r1', parentDigest: made.result.headDigest, publicKeys: nextKeys.map((k) => k.publicKey), threshold: 2 }, NOW).state;
+  const rot1 = s.domains[domainId].rotations.r1;
+  const msg = rotation.authorizationMessage(rot1);
+  s = rotation.submitSignatures(s, domainId, 'r1', [{ publicKey: members[0].publicKey, signature: sign(members[0].privateKey, msg) }], NOW).state;
+  s = rotation.submitSignatures(s, domainId, 'r1', [{ publicKey: members[1].publicKey, signature: sign(members[1].privateKey, msg) }], NOW).state;
+
+  const activated = s.domains[domainId];
+  // 模拟链头检查点丢失：只剩创世；headDigest 仍指向已激活轮换摘要，
+  // 恢复时必须仅凭 rotations.r1（activated）重建，证据校验随之生效。
+  const stripped = {
+    ...activated,
+    checkpoints: {
+      [made.result.headDigest]: activated.checkpoints[made.result.headDigest],
+    },
+  };
+
+  // 只有一份证据（不足父门限 2）→ 不得重建。
+  const insufficient = JSON.parse(JSON.stringify(stripped));
+  insufficient.rotations.r1.signatures = activated.rotations.r1.signatures.slice(0, 1);
+  assert.throws(
+    () => rotation.restoreDomain(insufficient),
+    (e) => e.code === 'chain_recovery_failed',
+    '证据不足门限时必须拒绝恢复',
+  );
+
+  // 证据签名被篡改 → 验签失败，不得重建。
+  const tampered = JSON.parse(JSON.stringify(stripped));
+  const badSig = tampered.rotations.r1.signatures[0].signature;
+  tampered.rotations.r1.signatures[0].signature =
+    badSig.slice(-1) === '0' ? badSig.slice(0, -1) + '1' : badSig.slice(0, -1) + '0';
+  assert.throws(
+    () => rotation.restoreDomain(tampered),
+    (e) => e.code === 'chain_recovery_failed',
+    '证据篡改时必须拒绝恢复',
+  );
+
+  // 已拒（superseded）候选即使签名齐备也不得据此补造检查点：
+  // 从检查点映射中移除链头，并把轮换标为已拒 —— 链头悬空时必须报错，
+  // 而不是把已拒候选伪造回历史链。
+  const rejectedOnly = JSON.parse(JSON.stringify(stripped));
+  delete rejectedOnly.checkpoints[activated.headDigest];
+  rejectedOnly.rotations.r1.status = 'superseded';
+  rejectedOnly.rotations.r1.rejectedReason = '已被取代';
+  assert.throws(
+    () => rotation.restoreDomain(rejectedOnly),
+    (e) => e.code === 'chain_recovery_failed' && /链头/.test(e.message),
+    '已拒候选缺失时链头悬空，必须报错而不是用候选伪造',
+  );
+});
+
+test('恢复：链头派生投影（代次/门限/密钥集）不一致时按链头归一化且不移动链头', () => {
+  const state = { version: 1, domains: {} };
+  const members = [genKey(), genKey()];
+  const made = rotation.createDomain(state, { name: '投影域', publicKeys: members.map((m) => m.publicKey), threshold: 2 }, NOW);
+  const domainId = made.result.id;
+  let s = made.state;
+  const nextKeys = [genKey(), genKey()];
+  s = rotation.createRotation(s, domainId, { rotationId: 'r1', parentDigest: made.result.headDigest, publicKeys: nextKeys.map((k) => k.publicKey), threshold: 2 }, NOW).state;
+  const rot1 = s.domains[domainId].rotations.r1;
+  const msg = rotation.authorizationMessage(rot1);
+  s = rotation.submitSignatures(s, domainId, 'r1', [{ publicKey: members[0].publicKey, signature: sign(members[0].privateKey, msg) }], NOW).state;
+  s = rotation.submitSignatures(s, domainId, 'r1', [{ publicKey: members[1].publicKey, signature: sign(members[1].privateKey, msg) }], NOW).state;
+
+  const activated = s.domains[domainId];
+  const corrupted = {
+    ...activated,
+    generation: 0, // 故意与链头代次不符
+    threshold: 1,
+    keys: members.map((m) => m.publicKey).sort(),
+  };
+  const { domain, recovered, normalized } = rotation.restoreDomain(corrupted);
+  assert.equal(recovered, 0, '检查点完整时无需重建');
+  assert.equal(normalized, true, '投影不一致应标记归一化');
+  assert.equal(domain.headDigest, activated.headDigest, '归一化不得移动活动链头');
+  assert.equal(domain.generation, 1);
+  assert.equal(domain.threshold, 2);
+  assert.deepEqual(domain.keys, rot1.keys);
+});
+
 test('持久化：竞争候选并发达标，磁盘上只有一个活动检查点', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotation-race-'));
   const store = new Store(path.join(dir, 'state.json'));

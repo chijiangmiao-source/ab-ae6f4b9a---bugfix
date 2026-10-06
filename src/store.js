@@ -17,32 +17,35 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
+const rotation = require('./rotation');
+
 const STATE_VERSION = 1;
 
 function initialState() {
   return { version: STATE_VERSION, domains: {} };
 }
 
-function compactLoadedState(state) {
-  const domains = Object.fromEntries(
-    Object.entries(state.domains).map(([domainId, domain]) => {
-      const head = domain.checkpoints[domain.headDigest];
-      const genesis = Object.values(domain.checkpoints).find((checkpoint) => checkpoint.generation === 0);
-      if (!head || !genesis || head.digest === genesis.digest) return [domainId, domain];
-
-      return [
-        domainId,
-        {
-          ...domain,
-          checkpoints: {
-            [genesis.digest]: genesis,
-            [head.digest]: head,
-          },
-        },
-      ];
-    }),
-  );
-  return { ...state, domains };
+/**
+ * 恢复磁盘状态：保留每代已激活检查点的完整历史，绝不压缩。
+ *
+ * 对每个设备域调用纯领域逻辑 rotation.restoreDomain：仅凭“已激活”的
+ * 轮换记录重建缺失检查点（逐份证据验签、重算摘要、校验父链连续性与
+ * 父门限），待签/已拒候选不会被伪造进历史，活动链头也不会被移动。
+ *
+ * 返回 { state, recoveredCount }；recoveredCount > 0 表示有受影响的
+ * 设备域被安全修复，调用方应将修复后的状态重新原子落盘。
+ */
+function restoreLoadedState(state) {
+  let recoveredCount = 0;
+  let normalizedCount = 0;
+  const domains = {};
+  for (const [domainId, domain] of Object.entries(state.domains)) {
+    const restored = rotation.restoreDomain(domain);
+    domains[domainId] = restored.domain;
+    recoveredCount += restored.recovered;
+    if (restored.normalized) normalizedCount += 1;
+  }
+  return { state: { ...state, domains }, recoveredCount, normalizedCount };
 }
 
 class Store {
@@ -52,7 +55,12 @@ class Store {
     this._queue = Promise.resolve();
   }
 
-  /** 启动时加载；状态文件不存在则初始化空状态并落盘。 */
+  /**
+   * 启动时加载；状态文件不存在则初始化空状态并落盘。
+   * 加载时复核并安全恢复完整检查点链：若历史上曾被压缩丢失中间代，
+   * 则仅凭已激活轮换记录（证据全部验签通过）重建，并把修复结果
+   * 重新原子落盘，使受影响的持久化设备域回到可复核状态。
+   */
   load() {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     if (fs.existsSync(this.file)) {
@@ -61,8 +69,14 @@ class Store {
       if (!parsed || parsed.version !== STATE_VERSION || typeof parsed.domains !== 'object' || parsed.domains === null) {
         throw new Error(`状态文件损坏或版本不受支持：${this.file}`);
       }
-      this.state = compactLoadedState(parsed);
-      this._persist(this.state);
+      const { state, recoveredCount, normalizedCount } = restoreLoadedState(parsed);
+      this.state = state;
+      if (recoveredCount > 0 || normalizedCount > 0) {
+        console.warn(
+          `[store] 授权链恢复完成：重建 ${recoveredCount} 个缺失检查点，归一化 ${normalizedCount} 个设备域的链头投影；已重新原子落盘`,
+        );
+        this._persist(this.state);
+      }
     } else {
       this.state = initialState();
       this._persist(this.state);
@@ -113,4 +127,4 @@ class Store {
   }
 }
 
-module.exports = { Store, initialState, STATE_VERSION };
+module.exports = { Store, initialState, restoreLoadedState, STATE_VERSION };

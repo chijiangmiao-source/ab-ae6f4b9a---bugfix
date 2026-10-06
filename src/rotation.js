@@ -395,6 +395,178 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
   };
 }
 
+/**
+ * 从已激活轮换记录构造检查点（字段与激活迁移中落盘的检查点逐字段一致）。
+ * 仅可用于 status === 'activated' 的轮换；待签/已拒候选不得据此入链。
+ */
+function checkpointFromActivatedRotation(rotation) {
+  return {
+    digest: rotation.digest,
+    domainId: rotation.domainId,
+    rotationId: rotation.rotationId,
+    parentDigest: rotation.parentDigest,
+    generation: rotation.generation,
+    threshold: rotation.threshold,
+    keys: rotation.keys,
+    status: 'activated',
+    activatedAt: rotation.activatedAt,
+    evidence: rotation.signatures.map((s) => ({ ...s })),
+  };
+}
+
+/**
+ * 复核一份非创世检查点的签名证据：
+ *  - 证据格式合法、签名者去重且均为父检查点密钥成员；
+ *  - 每条证据都能对规范 UTF-8 授权消息验签通过；
+ *  - 去重签名者数量达到父门限。
+ * 任一不满足都抛 chain_recovery_failed —— 绝不凭不可信证据重建历史。
+ */
+function assertEvidenceAuthentic(checkpoint, parentCheckpoint, rotation) {
+  const evidence = Array.isArray(checkpoint.evidence) ? checkpoint.evidence : null;
+  if (!evidence) {
+    throw new DomainError('chain_recovery_failed', `代次 ${checkpoint.generation} 的检查点缺少签名证据`);
+  }
+  const message = authorizationMessage(rotation);
+  const signers = new Set();
+  for (const evidenceEntry of evidence) {
+    const publicKey = evidenceEntry?.publicKey;
+    const signature = evidenceEntry?.signature;
+    if (!isHexKey(publicKey) || !isHexSignature(signature)) {
+      throw new DomainError('chain_recovery_failed', `代次 ${checkpoint.generation} 的证据编码非法，拒绝恢复`);
+    }
+    if (!parentCheckpoint.keys.includes(publicKey)) {
+      throw new DomainError('chain_recovery_failed', `代次 ${checkpoint.generation} 的证据签名者不是父密钥成员`);
+    }
+    if (signers.has(publicKey)) {
+      throw new DomainError('chain_recovery_failed', `代次 ${checkpoint.generation} 的证据存在重复签名者`);
+    }
+    if (!verifyAuthorization(message, signature, publicKey)) {
+      throw new DomainError('chain_recovery_failed', `代次 ${checkpoint.generation} 的证据验签失败（载荷可能被篡改）`);
+    }
+    signers.add(publicKey);
+  }
+  if (signers.size < parentCheckpoint.threshold) {
+    throw new DomainError(
+      'chain_recovery_failed',
+      `代次 ${checkpoint.generation} 的证据仅 ${signers.size} 份，未达父门限 ${parentCheckpoint.threshold}，不能重建为已激活检查点`,
+    );
+  }
+}
+
+/**
+ * 恢复/复核单个设备域的授权链（纯函数，供 Store 在加载磁盘状态时调用）：
+ *
+ *  1. 不丢弃任何已激活检查点；历史上被错误压缩掉的中间检查点，仅凭
+ *     rotations 中 status === 'activated' 的记录按代次重建 —— 待签或已拒
+ *     （superseded）候选一律不得伪造为历史；
+ *  2. 重建前逐份证据验签、重算摘要、确认父检查点已在链上且证据达到父门限；
+ *  3. 重建后复核整条链：创世有效、代次连续、固定父摘要逐代衔接、
+ *     摘要自洽、每个非创世检查点证据齐全；
+ *  4. 活动链头必须仍在链尖 —— 恢复过程绝不改变 headDigest。
+ *
+ * 返回 { domain, recovered }，recovered 为本次重建的检查点数量；
+ * 无法安全恢复时抛 DomainError('chain_recovery_failed')。
+ */
+function restoreDomain(inputDomain) {
+  if (!inputDomain || typeof inputDomain !== 'object' || !inputDomain.id) {
+    throw new DomainError('chain_recovery_failed', '设备域记录损坏，无法恢复授权链');
+  }
+  const domain = {
+    ...inputDomain,
+    checkpoints: { ...(inputDomain.checkpoints || {}) },
+    rotations: { ...(inputDomain.rotations || {}) },
+  };
+
+  // 仅已激活轮换可作为重建依据；按代次从低到高，保证父检查点先行就位。
+  const activatedRotations = Object.values(domain.rotations)
+    .filter((rotation) => rotation && rotation.status === 'activated')
+    .sort((a, b) => a.generation - b.generation);
+
+  let recovered = 0;
+  for (const rotation of activatedRotations) {
+    if (domain.checkpoints[rotation.digest]) continue;
+    if (rotation.domainId !== domain.id) {
+      throw new DomainError('chain_recovery_failed', `轮换 ${rotation.rotationId} 不属于设备域 ${domain.id}`);
+    }
+    const parentCheckpoint = domain.checkpoints[rotation.parentDigest];
+    if (!parentCheckpoint) {
+      throw new DomainError(
+        'chain_recovery_failed',
+        `轮换 ${rotation.rotationId}（代次 ${rotation.generation}）的父检查点缺失，无法按代次安全重建`,
+      );
+    }
+    const checkpoint = checkpointFromActivatedRotation(rotation);
+    if (checkpointDigest(checkpoint) !== checkpoint.digest) {
+      throw new DomainError('chain_recovery_failed', `轮换 ${rotation.rotationId} 的候选摘要重算不一致，拒绝重建`);
+    }
+    assertEvidenceAuthentic(checkpoint, parentCheckpoint, rotation);
+    domain.checkpoints[checkpoint.digest] = checkpoint;
+    recovered += 1;
+  }
+
+  // 整条链的完整性复核。
+  const chain = Object.values(domain.checkpoints).sort((a, b) => a.generation - b.generation);
+  if (chain.length === 0) {
+    throw new DomainError('chain_recovery_failed', `设备域 ${domain.id} 没有任何检查点`);
+  }
+  const genesis = chain[0];
+  if (genesis.generation !== 0 || genesis.parentDigest !== GENESIS_PARENT_DIGEST || genesis.status !== 'activated') {
+    throw new DomainError('chain_recovery_failed', `设备域 ${domain.id} 的创世检查点无效`);
+  }
+  if (checkpointDigest(genesis) !== genesis.digest) {
+    throw new DomainError('chain_recovery_failed', `设备域 ${domain.id} 的创世检查点摘要自洽校验失败`);
+  }
+
+  let previous = genesis;
+  for (let index = 1; index < chain.length; index += 1) {
+    const checkpoint = chain[index];
+    if (checkpoint.status !== 'activated') {
+      throw new DomainError('chain_recovery_failed', `代次 ${checkpoint.generation} 存在非激活检查点`);
+    }
+    if (checkpoint.generation !== previous.generation + 1) {
+      throw new DomainError('chain_recovery_failed', `代次 ${checkpoint.generation} 不连续（上代代为 ${previous.generation}）`);
+    }
+    if (checkpoint.parentDigest !== previous.digest) {
+      throw new DomainError(
+        'chain_recovery_failed',
+        `代次 ${checkpoint.generation} 的固定父摘要与上代链头不衔接，授权链断裂`,
+      );
+    }
+    if (checkpointDigest(checkpoint) !== checkpoint.digest) {
+      throw new DomainError('chain_recovery_failed', `代次 ${checkpoint.generation} 的检查点摘要重算不一致`);
+    }
+    const rotation = domain.rotations[checkpoint.rotationId];
+    if (!rotation || rotation.status !== 'activated' || rotation.digest !== checkpoint.digest) {
+      throw new DomainError('chain_recovery_failed', `代次 ${checkpoint.generation} 的检查点缺少对应的已激活轮换记录`);
+    }
+    assertEvidenceAuthentic(checkpoint, previous, rotation);
+    previous = checkpoint;
+  }
+
+  if (domain.headDigest !== previous.digest) {
+    throw new DomainError(
+      'chain_recovery_failed',
+      `设备域 ${domain.id} 的活动链头不在授权链尖（恢复不改变活动链头）`,
+    );
+  }
+
+  // generation/keys/threshold 只是链头的派生投影；若受损文件中与链头
+  // 不一致，则按链头归一化（不移动活动链头，也不改动任何检查点）。
+  let normalized = false;
+  if (
+    domain.generation !== previous.generation ||
+    domain.threshold !== previous.threshold ||
+    JSON.stringify(domain.keys || []) !== JSON.stringify(previous.keys)
+  ) {
+    domain.generation = previous.generation;
+    domain.threshold = previous.threshold;
+    domain.keys = previous.keys;
+    normalized = true;
+  }
+
+  return { domain, recovered, normalized };
+}
+
 /** 当前活动链头视图（含签名证据）。 */
 function headView(domain) {
   const head = domain.checkpoints[domain.headDigest];
@@ -429,5 +601,6 @@ module.exports = {
   createDomain,
   createRotation,
   submitSignatures,
+  restoreDomain,
   headView,
 };

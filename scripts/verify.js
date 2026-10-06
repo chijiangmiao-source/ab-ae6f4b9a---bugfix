@@ -11,8 +11,10 @@
  *      - 页面渲染出相同结果；
  *      - 激活后的竞争候选与迟到补签被拒；
  *      - 并发竞争候选只收敛为一个活动检查点；
- *      - 应用重启后链头、历史检查点与签名证据保持一致；
- *      - 健康端点反映设备域状态。
+ *      - 两轮以上连续轮换（后一轮以刚激活的链头为固定父摘要）后，
+ *        应用重启仍保留全部已激活检查点：数量、逐代摘要/父摘要连续性、
+ *        每个非创世检查点恰有两份验签通过的证据；
+ *      - 页面渲染出相同历史，健康端点反映最新链头与代次；
  *   全部通过退出码 0，否则退出码 1。
  */
 
@@ -88,6 +90,68 @@ function flipHex(hex) {
   const last = hex.slice(-1);
   const flipped = last === '0' ? '1' : '0';
   return hex.slice(0, -1) + flipped;
+}
+
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+
+function verifySig(publicKeyHex, message, signatureHex) {
+  try {
+    const publicKey = crypto.createPublicKey({
+      key: Buffer.concat([ED25519_SPKI_PREFIX, Buffer.from(publicKeyHex, 'hex')]),
+      format: 'der',
+      type: 'spki',
+    });
+    return crypto.verify(null, Buffer.from(message, 'utf8'), publicKey, Buffer.from(signatureHex, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+function expectedAuthorizationMessage(checkpoint, domainId) {
+  return [
+    'maintenance-rotation-authorization/v1',
+    `domain=${domainId}`,
+    `rotation=${checkpoint.rotationId}`,
+    `parent=${checkpoint.parentDigest}`,
+    `generation=${checkpoint.generation}`,
+    `threshold=${checkpoint.threshold}`,
+    `keys=${checkpoint.keys.join(',')}`,
+  ].join('\n');
+}
+
+/**
+ * 核对已激活检查点链：数量、代次连续、固定父摘要逐代衔接、
+ * 排序后密钥集与门限、每个非创世检查点恰有两份验签通过且签名者
+ * 均为父密钥成员的证据。
+ */
+function assertChainIntact(detail, expectedGenerations) {
+  const checkpoints = detail.checkpoints;
+  assertEqual(checkpoints.length, expectedGenerations + 1, `应有 ${expectedGenerations + 1} 个检查点（创世 + ${expectedGenerations} 代）`);
+  checkpoints.forEach((cp, index) => {
+    assertEqual(cp.generation, index, '检查点必须按代次 0..n 顺序排列');
+    assertEqual(cp.status, 'activated', `代次 ${index} 必须是已激活检查点`);
+    assert(
+      JSON.stringify(cp.keys) === JSON.stringify([...cp.keys].sort()),
+      `代次 ${index} 密钥集必须排序`,
+    );
+    if (index === 0) {
+      assertEqual(cp.parentDigest, '0'.repeat(64), '创世父摘要应为全 0');
+      assertEqual(cp.evidence.length, 0, '创世检查点不应有签名证据');
+    } else {
+      assertEqual(cp.parentDigest, checkpoints[index - 1].digest, `代次 ${index} 的固定父摘要必须衔接到上一代摘要`);
+      assertEqual(cp.evidence.length, 2, `代次 ${index} 必须恰有两份签名证据`);
+      const signers = cp.evidence.map((e) => e.publicKey);
+      assertEqual(new Set(signers).size, 2, `代次 ${index} 证据签名者必须去重`);
+      const parentKeys = checkpoints[index - 1].keys;
+      const message = expectedAuthorizationMessage(cp, detail.id);
+      for (const evidence of cp.evidence) {
+        assert(parentKeys.includes(evidence.publicKey), `代次 ${index} 的证据签名者必须是父密钥成员`);
+        assert(verifySig(evidence.publicKey, message, evidence.signature), `代次 ${index} 的证据必须对规范消息验签通过`);
+      }
+    }
+  });
+  assertEqual(detail.headDigest, checkpoints[checkpoints.length - 1].digest, '详情链头必须等于最新检查点');
+  assertEqual(detail.generation, expectedGenerations, '详情代次必须为最新代次');
 }
 
 async function waitForHealth(timeoutMs, predicate) {
@@ -289,6 +353,68 @@ async function main() {
     assertEqual(head.digest, rotationDigest, '竞争请求改变了链头');
   });
 
+  // —— 第二轮轮换：以刚激活的第一代链头作为固定父摘要 ——
+  const memberC = nextC;
+  const memberD = nextD;
+  const nextE = genKey();
+  const nextF = genKey();
+  let rotation2Digest;
+
+  await step('第二轮候选：固定父摘要为刚激活的第一代链头', async () => {
+    const res = await api('POST', `/api/domains/${domainId}/rotations`, {
+      rotationId: 'rot-2026-002',
+      parentDigest: rotationDigest,
+      publicKeys: [nextF.publicKey, nextE.publicKey],
+      threshold: 2,
+    });
+    assertEqual(res.status, 201, `创建第二轮轮换失败：${res.text}`);
+    rotation2Digest = res.json.digest;
+    assertEqual(res.json.parentDigest, rotationDigest, '第二轮父摘要必须是刚激活的链头');
+    assertEqual(res.json.generation, 2, '第二轮代次应为 2');
+    assertEqual(res.json.threshold, 2);
+    assert(
+      JSON.stringify(res.json.keys) === JSON.stringify([nextE.publicKey, nextF.publicKey].sort()),
+      '第二轮新公钥集未排序',
+    );
+    assertEqual(res.json.status, 'pending', '候选应处于待签状态');
+  });
+
+  await step('第二轮两名父成员（第一代新密钥）分批签名后激活，链头前进到第二代', async () => {
+    const msgRes = await api('GET', `/api/domains/${domainId}/rotations/rot-2026-002/message`);
+    const message = msgRes.json.message;
+    assert(message.includes(`parent=${rotationDigest}`), '第二轮待签消息必须绑定第一代链头');
+    const sigC = sign(memberC, message);
+    const sigD = sign(memberD, message);
+
+    // 非本届父成员（上一代成员 A）签名必须被拒。
+    const outsiderSig = await api('POST', `/api/domains/${domainId}/rotations/rot-2026-002/signatures`, {
+      signatures: [{ publicKey: memberA.publicKey, signature: sign(memberA, message) }],
+    });
+    assertEqual(outsiderSig.json.results[0].code, 'not_parent_member', '上一代成员不再是父成员');
+
+    const first = await api('POST', `/api/domains/${domainId}/rotations/rot-2026-002/signatures`, {
+      signatures: [{ publicKey: memberC.publicKey, signature: sigC }],
+    });
+    assertEqual(first.json.activated, false, '第一批只达 1/2，不得提前激活');
+    const second = await api('POST', `/api/domains/${domainId}/rotations/rot-2026-002/signatures`, {
+      signatures: [{ publicKey: memberD.publicKey, signature: sigD }],
+    });
+    assertEqual(second.json.activated, true, '补齐第二名签名后应激活');
+    assertEqual(second.json.headDigest, rotation2Digest, '链头应前进到第二代摘要');
+
+    const head = (await api('GET', `/api/domains/${domainId}/head`)).json;
+    assertEqual(head.generation, 2, '链头代次应为 2');
+    assertEqual(head.parentDigest, rotationDigest, '第二代父摘要必须指向第一代');
+    assertEqual(head.evidence.length, 2, '第二代必须恰有两份证据');
+  });
+
+  await step('重启前：详情接口包含连续三代检查点且每代证据完整', async () => {
+    const detail = (await api('GET', `/api/domains/${domainId}`)).json;
+    assertChainIntact(detail, 2);
+    assertEqual(detail.checkpoints[1].digest, rotationDigest, '第一代检查点摘要必须保留');
+    assertEqual(detail.checkpoints[2].digest, rotation2Digest, '第二代检查点摘要必须为链头');
+  });
+
   // —— 第二设备域：并发竞争只收敛为一个活动检查点 ——
   let domain2Id;
   let domain2Head;
@@ -362,27 +488,46 @@ async function main() {
       JSON.stringify(domain2After) === JSON.stringify(domain2Before),
       '并发域重启前后状态不一致（链头/检查点/证据丢失）',
     );
+
+    // 关键回归：两代轮换后重启，中间已激活检查点与两份证据必须仍在链上。
+    assertChainIntact(domain1After, 2);
+    assertEqual(domain1After.checkpoints.length, 3, '重启后必须仍能看到创世、第一代与第二代三个检查点');
+    assertEqual(domain1After.checkpoints[0].digest, genesisHead, '重启后创世检查点必须保留');
+    assertEqual(domain1After.checkpoints[1].digest, rotationDigest, '重启后第一代（中间代）检查点必须保留');
+    assertEqual(domain1After.checkpoints[2].digest, rotation2Digest, '重启后第二代检查点必须保留');
+    const firstGen = domain1After.checkpoints[1];
+    assertEqual(firstGen.evidence.length, 2, '第一代的两份签名证据必须在重启后保留');
+    assertEqual(firstGen.parentDigest, genesisHead, '第一代固定父摘要必须仍指向创世');
+    assertEqual(domain1After.checkpoints[2].parentDigest, rotationDigest, '第二代固定父摘要必须仍指向第一代');
+
     const head = (await api('GET', `/api/domains/${domainId}/head`)).json;
-    assertEqual(head.digest, rotationDigest, '重启后链头摘要变化');
+    assertEqual(head.digest, rotation2Digest, '重启后链头摘要必须仍是第二代');
+    assertEqual(head.generation, 2, '重启后最新代次必须仍是 2');
     assertEqual(head.evidence.length, 2, '重启后签名证据份数变化');
   });
 
-  await step('健康响应在重启后仍反映设备域状态', async () => {
+  await step('健康响应在重启后仍反映设备域最新链头与代次', async () => {
     const health = (await api('GET', '/healthz')).json;
     const d1 = health.domains.find((d) => d.id === domainId);
     const d2 = health.domains.find((d) => d.id === domain2Id);
-    assert(d1 && d1.headDigest === rotationDigest, '健康响应中验收域链头不符');
+    assert(d1 && d1.headDigest === rotation2Digest, '健康响应中验收域链头必须为第二代');
+    assertEqual(d1 && d1.generation, 2, '健康响应中验收域代次必须为 2');
     assert(d2 && d2.headDigest === domain2Head, '健康响应中并发域链头不符');
   });
 
-  await step('页面显示与接口相同的结果（链头、证据、检查点分组）', async () => {
+  await step('页面显示与接口相同的完整历史（创世、中间代、最新代及各代证据）', async () => {
     const page = await api('GET', '/');
     assertEqual(page.status, 200, '页面应可访问');
-    assert(page.text.includes(rotationDigest), '页面未显示已激活链头摘要');
-    assert(page.text.includes(memberA.publicKey), '页面未显示成员 A 的签名证据');
-    assert(page.text.includes(memberB.publicKey), '页面未显示成员 B 的签名证据');
-    assert(page.text.includes(sigA), '页面未显示成员 A 的签名值');
-    assert(page.text.includes('rot-2026-001'), '页面未显示轮换标识');
+    assert(page.text.includes(rotationDigest), '页面未显示第一代（中间代）检查点摘要');
+    assert(page.text.includes(rotation2Digest), '页面未显示第二代已激活链头摘要');
+    assert(page.text.includes(genesisHead), '页面未显示创世检查点摘要');
+    assert(page.text.includes(memberA.publicKey), '页面未显示第一代证据成员 A');
+    assert(page.text.includes(memberB.publicKey), '页面未显示第一代证据成员 B');
+    assert(page.text.includes(memberC.publicKey), '页面未显示第二代证据成员 C');
+    assert(page.text.includes(memberD.publicKey), '页面未显示第二代证据成员 D');
+    assert(page.text.includes(sigA), '页面未显示第一代成员 A 的签名值');
+    assert(page.text.includes('rot-2026-001'), '页面未显示第一代轮换标识');
+    assert(page.text.includes('rot-2026-002'), '页面未显示第二代轮换标识');
     assert(page.text.includes('已激活'), '页面缺少已激活检查点分组');
     assert(page.text.includes('已拒'), '页面缺少已拒检查点分组');
     assert(page.text.includes('待签'), '页面缺少待签检查点分组');
